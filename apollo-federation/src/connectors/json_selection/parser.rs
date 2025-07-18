@@ -429,11 +429,11 @@ impl ExternalVarPaths for NamedSelection {
 
 // Path                 ::= VarPath | KeyPath | AtPath | ExprPath
 // PathSelection        ::= Path SubSelection?
-// PathWithSubSelection ::= Path SubSelection
-// VarPath              ::= "$" (NO_SPACE Identifier)? PathStep*
-// KeyPath              ::= Key PathStep+
-// AtPath               ::= "@" PathStep*
-// ExprPath             ::= "$(" LitExpr ")" PathStep*
+// VarPath              ::= "$" (NO_SPACE Identifier)? PathTail
+// KeyPath              ::= Key PathTail
+// AtPath               ::= "@" PathTail
+// ExprPath             ::= "$(" LitExpr ")" PathTail
+// PathTail             ::= "?"? (PathStep "?"?)*
 // PathStep             ::= "." Key | "->" Identifier MethodArgs?
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -553,8 +553,13 @@ pub(super) enum PathList {
     // middle/tail (not the beginning) of a PathSelection.
     Method(WithRange<String>, Option<MethodArgs>, WithRange<PathList>),
 
-    // Universal null guard that can wrap any path continuation.
-    // If data is null, returns null instead of continuing with the wrapped operation.
+    // Represents the ? syntax used for some.path?->method(...) optional
+    // chaining. If the preceding some.path value is missing (None) or null,
+    // some.path? evaluates to None, terminating path evaluation without an
+    // error. All other (non-null) values are passed along without change.
+    //
+    // The WithRange<PathList> parameter represents the rest of the path
+    // following the `?` token.
     Question(WithRange<PathList>),
 
     // Optionally, a PathList may end with a SubSelection, which applies a set
@@ -707,12 +712,34 @@ impl PathList {
             ));
         }
 
-        // Universal optional operator: ? (note: we parse this before other operators to avoid conflicts)
-        if let Ok((suffix, question)) = ranged_span("?")(input) {
-            // Parse whatever comes after the ? normally
-            let (remainder, tail) = Self::parse_with_depth(suffix, depth)?;
-            let full_range = merge_ranges(question.range(), tail.range());
-            return Ok((remainder, WithRange::new(Self::Question(tail), full_range)));
+        // At any depth, if the next token is ? but not the PathList::Question
+        // kind, we terminate path parsing so the hypothetical ?? or ?! tokens
+        // have a chance to be parsed as infix operators.
+        if input.fragment().starts_with("??") || input.fragment().starts_with("?!") {
+            return Ok((input, WithRange::new(Self::Empty, range_if_empty)));
+        }
+
+        if let Ok((suffix, question)) = ranged_span("?")(input.clone()) {
+            let (remainder, rest) = Self::parse_with_depth(suffix, depth + 1)?;
+
+            return match rest.as_ref() {
+                // The ? cannot be repeated sequentially, so if rest starts with
+                // another PathList::Question, we terminate the current path,
+                // probably (but not necessarily) leading to a parse error for
+                // the upcoming ?.
+                PathList::Question(_) => {
+                    let empty_range = question.range().map(|range| range.end..range.end);
+                    let empty = WithRange::new(Self::Empty, empty_range);
+                    Ok((
+                        suffix,
+                        WithRange::new(Self::Question(empty), question.range()),
+                    ))
+                }
+                _ => {
+                    let full_range = merge_ranges(question.range(), rest.range());
+                    Ok((remainder, WithRange::new(Self::Question(rest), full_range)))
+                }
+            };
         }
 
         // In previous versions of this code, a .key could appear at depth 0 (at
@@ -3285,6 +3312,48 @@ mod tests {
                 )
                 .into_with_range(),
             },
+        );
+    }
+
+    #[test]
+    fn test_invalid_sequential_question_marks() {
+        assert_eq!(
+            JSONSelection::parse("baz: $.foo??.bar"),
+            Err(JSONSelectionParseError {
+                message: "nom::error::ErrorKind::Eof".to_string(),
+                fragment: "??.bar".to_string(),
+                offset: 10,
+            }),
+        );
+
+        assert_eq!(
+            JSONSelection::parse("baz: $.foo?->echo(null)??.bar"),
+            Err(JSONSelectionParseError {
+                message: "nom::error::ErrorKind::Eof".to_string(),
+                fragment: "??.bar".to_string(),
+                offset: 23,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_invalid_infix_operator_parsing() {
+        assert_eq!(
+            JSONSelection::parse("aOrB: $($.a ?? $.b)"),
+            Err(JSONSelectionParseError {
+                message: "nom::error::ErrorKind::Eof".to_string(),
+                fragment: "($.a ?? $.b)".to_string(),
+                offset: 7,
+            }),
+        );
+
+        assert_eq!(
+            JSONSelection::parse("aOrB: $($.a ?! $.b)"),
+            Err(JSONSelectionParseError {
+                message: "nom::error::ErrorKind::Eof".to_string(),
+                fragment: "($.a ?! $.b)".to_string(),
+                offset: 7,
+            }),
         );
     }
 
