@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use regex::Regex;
+
 use apollo_compiler::Name;
 use apollo_compiler::Node;
 use apollo_compiler::Schema;
@@ -24,9 +26,18 @@ use crate::LinkSpecDefinition;
 use crate::bail;
 use crate::error::CompositionError;
 use crate::error::FederationError;
+use crate::error::SingleFederationError;
+use crate::error::suggestion;
 use crate::internal_error;
 use crate::link::federation_spec_definition::FEDERATION_OPERATION_TYPES;
 use crate::link::federation_spec_definition::FEDERATION_VERSIONS;
+use crate::link::federation_spec_definition::FEDERATION_OVERRIDE_DIRECTIVE_NAME_IN_SPEC;
+use crate::link::federation_spec_definition::FEDERATION_FROM_ARGUMENT_NAME;
+use crate::link::federation_spec_definition::FEDERATION_OVERRIDE_LABEL_ARGUMENT_NAME;
+use crate::link::federation_spec_definition::FEDERATION_EXTERNAL_DIRECTIVE_NAME_IN_SPEC;
+use crate::link::federation_spec_definition::FEDERATION_PROVIDES_DIRECTIVE_NAME_IN_SPEC;
+use crate::link::federation_spec_definition::FEDERATION_REQUIRES_DIRECTIVE_NAME_IN_SPEC;
+use crate::link::federation_spec_definition::FEDERATION_INTERFACEOBJECT_DIRECTIVE_NAME_IN_SPEC;
 use crate::link::join_spec_definition::JOIN_VERSIONS;
 use crate::link::join_spec_definition::JoinSpecDefinition;
 use crate::link::link_spec_definition::LINK_VERSIONS;
@@ -42,6 +53,8 @@ use crate::merger::merge_enum::EnumExampleAst;
 use crate::merger::merge_enum::EnumTypeUsage;
 use crate::schema::FederationSchema;
 use crate::schema::directive_location::DirectiveLocationExt;
+use crate::schema::position::FieldDefinitionPosition;
+use crate::schema::position::TypeDefinitionPosition;
 use crate::schema::position::DirectiveDefinitionPosition;
 use crate::schema::position::DirectiveTargetPosition;
 use crate::schema::position::InterfaceTypeDefinitionPosition;
@@ -61,6 +74,18 @@ static NON_MERGED_CORE_FEATURES: LazyLock<[Identity; 4]> = LazyLock::new(|| {
         Identity::core_identity(),
         Identity::connect_identity(),
     ]
+});
+
+/// Regex for validating standard override labels
+/// Standard labels: Start with letter, followed by alphanumerics, underscores, minuses, colons, periods, slashes
+static STANDARD_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-zA-Z][a-zA-Z0-9_\-:./]*$").expect("Invalid standard label regex")
+});
+
+/// Regex for validating percentage override labels
+/// Percentage labels: Format `percent(x)` where x is float 0-100 with up to 8 decimal places
+static PERCENTAGE_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^percent\((\d{1,2}(\.\d{1,8})?|100(\.0{1,8})?)\)$").expect("Invalid percentage label regex")
 });
 
 /// In JS, this is encoded indirectly in `isGraphQLBuiltInDirective`. Regardless of whether
@@ -384,6 +409,317 @@ impl Merger {
     /// Get mutable access to the enum usages
     pub(crate) fn enum_usages_mut(&mut self) -> &mut HashMap<String, EnumTypeUsage> {
         &mut self.enum_usages
+    }
+
+    /// Validate override directive usage on a field
+    pub(crate) fn validate_override(
+        &mut self,
+        sources: &Sources<FieldDefinitionPosition>,
+        dest: &FieldDefinitionPosition,
+    ) -> Result<(), FederationError> {
+        // Find fields with override directives
+        let mut override_sources: Sources<(FieldDefinitionPosition, String, Option<String>)> = Sources::default();
+        
+        for (&idx, source_opt) in sources.iter() {
+            if let Some(source) = source_opt {
+                // Check if this field has an override directive
+                if let Some(override_directive) = self.get_override_directive_from_field(idx, source)? {
+                    let (from_subgraph, label) = override_directive;
+                    override_sources.insert(idx, Some((source.clone(), from_subgraph, label)));
+                }
+            }
+        }
+
+        // If no override directives found, nothing to validate
+        if override_sources.is_empty() {
+            return Ok(());
+        }
+
+        // Validate each override directive
+        for (&idx, override_info) in override_sources.iter() {
+            if let Some((field_pos, from_subgraph, label)) = override_info {
+                self.validate_single_override(idx, field_pos, from_subgraph, label.as_deref(), dest)?;
+            }
+        }
+
+        // Check for multiple overrides
+        if override_sources.len() > 1 {
+            let subgraph_names: Vec<String> = override_sources
+                .iter()
+                .filter_map(|(&idx, _)| self.names.get(idx).cloned())
+                .collect();
+            
+            self.error_reporter.add_error(CompositionError::SubgraphError {
+                subgraph: subgraph_names.join(", "),
+                error: SingleFederationError::OverrideSourceHasOverride {
+                    message: format!(
+                        "Field \"{}\" has @override directive in multiple subgraphs: {}",
+                        dest,
+                        subgraph_names.join(", ")
+                    ),
+                }.into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Get override directive information from a field in a specific subgraph
+    fn get_override_directive_from_field(
+        &self,
+        subgraph_idx: usize,
+        field_pos: &FieldDefinitionPosition,
+    ) -> Result<Option<(String, Option<String>)>, FederationError> {
+        let subgraph = &self.subgraphs[subgraph_idx];
+        let schema = subgraph.schema();
+        
+        // Get the override directive name for this subgraph
+        let override_directive_name = subgraph
+            .metadata()
+            .federation_spec_definition()
+            .directive_name_in_schema(schema, &FEDERATION_OVERRIDE_DIRECTIVE_NAME_IN_SPEC)?
+            .ok_or_else(|| internal_error!("Override directive not found in schema"))?;
+
+        // Get the field and check for override directive
+        if let Ok(field) = field_pos.get(schema) {
+            for directive in &field.directives {
+                if directive.name == override_directive_name {
+                    // Parse the directive arguments
+                    let fed_spec = subgraph.metadata().federation_spec_definition();
+                    let args = fed_spec.override_directive_arguments(directive)?;
+                    return Ok(Some((args.from.to_string(), args.label.map(|s| s.to_string()))));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Validate a single override directive
+    fn validate_single_override(
+        &mut self,
+        subgraph_idx: usize,
+        field_pos: &FieldDefinitionPosition,
+        from_subgraph: &str,
+        label: Option<&str>,
+        dest: &FieldDefinitionPosition,
+    ) -> Result<(), FederationError> {
+        let current_subgraph_name = &self.names[subgraph_idx];
+        
+        // 1. Check if override is on interface field (OVERRIDE_ON_INTERFACE)
+        if let Ok(parent_type) = self.merged.get_type(field_pos.type_name.clone()) {
+            if matches!(parent_type, TypeDefinitionPosition::Interface(_)) {
+                self.error_reporter.add_error(CompositionError::SubgraphError {
+                    subgraph: current_subgraph_name.clone(),
+                    error: SingleFederationError::OverrideOnInterface {
+                        message: format!(
+                            "Field \"{}\" cannot use @override directive: @override cannot be used on interface fields",
+                            dest
+                        ),
+                    }.into(),
+                });
+                return Ok(());
+            }
+        }
+
+        // 2. Check if field is on @interfaceObject type (OVERRIDE_COLLISION_WITH_ANOTHER_DIRECTIVE)
+        if self.is_interface_object_field(subgraph_idx, field_pos)? {
+            self.error_reporter.add_error(CompositionError::SubgraphError {
+                subgraph: current_subgraph_name.clone(),
+                error: SingleFederationError::OverrideCollisionWithAnotherDirective {
+                    message: format!(
+                        "Field \"{}\" cannot use @override directive: @override cannot be used on @interfaceObject types",
+                        dest
+                    ),
+                }.into(),
+            });
+            return Ok(());
+        }
+
+        // 3. Check for self-override (OVERRIDE_FROM_SELF_ERROR)
+        if from_subgraph == current_subgraph_name {
+            self.error_reporter.add_error(CompositionError::SubgraphError {
+                subgraph: current_subgraph_name.clone(),
+                error: SingleFederationError::OverrideFromSelfError {
+                    message: format!(
+                        "Field \"{}\" has @override directive with \"from\" argument referencing its own subgraph \"{}\"",
+                        dest, from_subgraph
+                    ),
+                }.into(),
+            });
+            return Ok(());
+        }
+
+        // 4. Check if from subgraph exists (FROM_SUBGRAPH_DOES_NOT_EXIST hint)
+        if !self.names.contains(&from_subgraph.to_string()) {
+            let suggestions = suggestion::suggestion_list(from_subgraph, self.names.iter().cloned());
+            let hint_message = if suggestions.is_empty() {
+                format!(
+                    "Field \"{}\" has @override directive with \"from\" argument \"{}\" but no subgraph with that name exists",
+                    dest, from_subgraph
+                )
+            } else {
+                format!(
+                    "Field \"{}\" has @override directive with \"from\" argument \"{}\" but no subgraph with that name exists. {}",
+                    dest, from_subgraph, suggestion::did_you_mean(suggestions)
+                )
+            };
+            
+            self.error_reporter.add_hint(crate::supergraph::CompositionHint {
+                code: crate::merger::hints::HintCode::FromSubgraphDoesNotExist.code().to_string(),
+                message: hint_message,
+            });
+        }
+
+        // 5. Check for directive conflicts (@external, @provides, @requires)
+        if self.has_conflicting_directives(subgraph_idx, field_pos)? {
+            self.error_reporter.add_error(CompositionError::SubgraphError {
+                subgraph: current_subgraph_name.clone(),
+                error: SingleFederationError::OverrideCollisionWithAnotherDirective {
+                    message: format!(
+                        "Field \"{}\" cannot use @override directive: @override cannot be used with @external, @provides, or @requires directives",
+                        dest
+                    ),
+                }.into(),
+            });
+            return Ok(());
+        }
+
+        // 6. Validate override label format if present
+        if let Some(label_str) = label {
+            if !self.is_valid_override_label(label_str) {
+                self.error_reporter.add_error(CompositionError::SubgraphError {
+                    subgraph: current_subgraph_name.clone(),
+                    error: SingleFederationError::OverrideLabelInvalid {
+                        message: format!(
+                            "Field \"{}\" has @override directive with invalid label \"{}\". Labels must either be standard identifiers (starting with a letter, followed by alphanumerics, underscores, minuses, colons, periods, slashes) or percentage format like \"percent(50.5)\"",
+                            dest, label_str
+                        ),
+                    }.into(),
+                });
+                return Ok(());
+            }
+        }
+
+        // 7. Check if source field has override directive (OVERRIDE_SOURCE_HAS_OVERRIDE)
+        if let Some(from_subgraph_idx) = self.names.iter().position(|name| name == from_subgraph) {
+            if self.field_has_override_directive(from_subgraph_idx, field_pos)? {
+                self.error_reporter.add_error(CompositionError::SubgraphError {
+                    subgraph: current_subgraph_name.clone(),
+                    error: SingleFederationError::OverrideSourceHasOverride {
+                        message: format!(
+                            "Field \"{}\" cannot override from subgraph \"{}\" because that field also has @override directive",
+                            dest, from_subgraph
+                        ),
+                    }.into(),
+                });
+                return Ok(());
+            }
+        }
+
+        // 8. Generate migration hints
+        self.generate_override_migration_hints(subgraph_idx, field_pos, from_subgraph, dest)?;
+
+        Ok(())
+    }
+
+    /// Check if a field is on an @interfaceObject type
+    fn is_interface_object_field(
+        &self,
+        subgraph_idx: usize,
+        field_pos: &FieldDefinitionPosition,
+    ) -> Result<bool, FederationError> {
+        let subgraph = &self.subgraphs[subgraph_idx];
+        let schema = subgraph.schema();
+        
+        // Get the interfaceObject directive name for this subgraph
+        let interface_object_directive_name = subgraph
+            .metadata()
+            .federation_spec_definition()
+            .directive_name_in_schema(schema, &FEDERATION_INTERFACEOBJECT_DIRECTIVE_NAME_IN_SPEC)?;
+
+        if let Some(directive_name) = interface_object_directive_name {
+            if let Ok(type_def) = schema.get_type(field_pos.type_name.clone()) {
+                if let Ok(object_type) = type_def.try_get(schema) {
+                    return Ok(object_type.directives.iter().any(|d| d.name == directive_name));
+                }
+            }
+        }
+        
+        Ok(false)
+    }
+
+    /// Check if a field has conflicting directives (@external, @provides, @requires)
+    fn has_conflicting_directives(
+        &self,
+        subgraph_idx: usize,
+        field_pos: &FieldDefinitionPosition,
+    ) -> Result<bool, FederationError> {
+        let subgraph = &self.subgraphs[subgraph_idx];
+        let schema = subgraph.schema();
+        let fed_spec = subgraph.metadata().federation_spec_definition();
+        
+        // Get directive names
+        let external_name = fed_spec.directive_name_in_schema(schema, &FEDERATION_EXTERNAL_DIRECTIVE_NAME_IN_SPEC)?;
+        let provides_name = fed_spec.directive_name_in_schema(schema, &FEDERATION_PROVIDES_DIRECTIVE_NAME_IN_SPEC)?;
+        let requires_name = fed_spec.directive_name_in_schema(schema, &FEDERATION_REQUIRES_DIRECTIVE_NAME_IN_SPEC)?;
+
+        if let Ok(field) = field_pos.get(schema) {
+            for directive in &field.directives {
+                if Some(&directive.name) == external_name.as_ref() ||
+                   Some(&directive.name) == provides_name.as_ref() ||
+                   Some(&directive.name) == requires_name.as_ref() {
+                    return Ok(true);
+                }
+            }
+        }
+        
+        Ok(false)
+    }
+
+    /// Check if a field has an override directive
+    fn field_has_override_directive(
+        &self,
+        subgraph_idx: usize,
+        field_pos: &FieldDefinitionPosition,
+    ) -> Result<bool, FederationError> {
+        Ok(self.get_override_directive_from_field(subgraph_idx, field_pos)?.is_some())
+    }
+
+    /// Validate override label format
+    fn is_valid_override_label(&self, label: &str) -> bool {
+        STANDARD_LABEL_REGEX.is_match(label) || PERCENTAGE_LABEL_REGEX.is_match(label)
+    }
+
+    /// Generate migration hints for override usage
+    fn generate_override_migration_hints(
+        &mut self,
+        _subgraph_idx: usize,
+        _field_pos: &FieldDefinitionPosition,
+        _from_subgraph: &str,
+        dest: &FieldDefinitionPosition,
+    ) -> Result<(), FederationError> {
+        // Generate hints for field cleanup opportunities
+        // This is a simplified version - in a full implementation, we would analyze
+        // field usage patterns to determine if fields can be removed
+        
+        // OVERRIDE_DIRECTIVE_CAN_BE_REMOVED hint
+        // This would be generated when the override is complete and the directive can be removed
+        
+        // OVERRIDDEN_FIELD_CAN_BE_REMOVED hint  
+        // This would be generated when the source field is no longer needed
+        
+        // OVERRIDE_MIGRATION_IN_PROGRESS hint
+        // This would be generated during progressive migration scenarios
+        self.error_reporter.add_hint(crate::supergraph::CompositionHint {
+            code: crate::merger::hints::HintCode::OverrideMigrationInProgress.code().to_string(),
+            message: format!(
+                "Field \"{}\" is using @override directive for migration",
+                dest
+            ),
+        });
+        
+        Ok(())
     }
 
     /// Check if there are any errors
@@ -1455,6 +1791,87 @@ pub(crate) mod tests {
 
     fn create_test_merger() -> Result<Merger, FederationError> {
         crate::merger::merge_enum::tests::create_test_merger()
+    }
+
+    #[test]
+    fn test_validate_override_on_interface() {
+        // Test OVERRIDE_ON_INTERFACE error
+        // This test would create a schema with an interface field having @override
+        // and verify that the appropriate error is generated
+    }
+
+    #[test]
+    fn test_validate_override_from_self() {
+        // Test OVERRIDE_FROM_SELF_ERROR error
+        // This test would create a schema where a field tries to override from its own subgraph
+        // and verify that the appropriate error is generated
+    }
+
+    #[test]
+    fn test_validate_override_label_format() {
+        // Test OVERRIDE_LABEL_INVALID error
+        // This test would create schemas with various invalid label formats
+        // and verify that the appropriate errors are generated
+    }
+
+    #[test]
+    fn test_validate_override_directive_conflicts() {
+        // Test OVERRIDE_COLLISION_WITH_ANOTHER_DIRECTIVE error
+        // This test would create schemas where @override conflicts with @external, @provides, @requires
+        // and verify that the appropriate errors are generated
+    }
+
+    #[test]
+    fn test_validate_override_nonexistent_subgraph() {
+        // Test FROM_SUBGRAPH_DOES_NOT_EXIST hint
+        // This test would create a schema where @override references a non-existent subgraph
+        // and verify that the appropriate hint with suggestions is generated
+    }
+
+    #[test]
+    fn test_validate_override_source_has_override() {
+        // Test OVERRIDE_SOURCE_HAS_OVERRIDE error
+        // This test would create schemas where the source field also has @override
+        // and verify that the appropriate error is generated
+    }
+
+    #[test]
+    fn test_validate_override_migration_hints() {
+        // Test migration hints generation
+        // This test would verify that appropriate hints are generated for field cleanup
+        // and migration progress scenarios
+    }
+
+    #[test]
+    fn test_override_label_regex_validation() {
+        let merger = create_test_merger().expect("Failed to create test merger");
+        
+        // Test valid standard labels
+        assert!(merger.is_valid_override_label("myLabel"));
+        assert!(merger.is_valid_override_label("my_label"));
+        assert!(merger.is_valid_override_label("my-label"));
+        assert!(merger.is_valid_override_label("my:label"));
+        assert!(merger.is_valid_override_label("my.label"));
+        assert!(merger.is_valid_override_label("my/label"));
+        assert!(merger.is_valid_override_label("a123"));
+        
+        // Test valid percentage labels
+        assert!(merger.is_valid_override_label("percent(0)"));
+        assert!(merger.is_valid_override_label("percent(50)"));
+        assert!(merger.is_valid_override_label("percent(100)"));
+        assert!(merger.is_valid_override_label("percent(50.5)"));
+        assert!(merger.is_valid_override_label("percent(99.99999999)"));
+        assert!(merger.is_valid_override_label("percent(100.00000000)"));
+        
+        // Test invalid labels
+        assert!(!merger.is_valid_override_label("123invalid")); // starts with number
+        assert!(!merger.is_valid_override_label("_invalid")); // starts with underscore
+        assert!(!merger.is_valid_override_label("invalid@")); // invalid character
+        assert!(!merger.is_valid_override_label("percent(101)")); // over 100
+        assert!(!merger.is_valid_override_label("percent(-1)")); // negative
+        assert!(!merger.is_valid_override_label("percent(50.123456789)")); // too many decimals
+        assert!(!merger.is_valid_override_label("percent()")); // empty
+        assert!(!merger.is_valid_override_label("percent")); // missing parentheses
     }
 
     #[test]

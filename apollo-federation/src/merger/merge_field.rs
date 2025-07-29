@@ -21,6 +21,8 @@ impl Merger {
         sources: &Sources<FieldDefinitionPosition>,
         dest: &FieldDefinitionPosition,
     ) -> Result<(), FederationError> {
+        // Validate override directive usage before proceeding with field merging
+        self.validate_override(sources, dest)?;
         let every_source_is_external = sources.iter().all(|(i, source)| {
             let Some(metadata) = self.subgraphs.get(*i).map(|s| s.metadata()) else {
                 // If subgraph not found, consider it not external to fail safely
