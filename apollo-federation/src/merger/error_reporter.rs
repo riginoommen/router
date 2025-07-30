@@ -113,10 +113,10 @@ impl ErrorReporter {
                         output_length_limit: None,
                     },
                 );
-                myself.add_hint(CompositionHint {
-                    code: code.code().to_string(),
-                    message: format!("{message}{distribution_str}"),
-                });
+                myself.add_hint(CompositionHint::new(
+                    format!("{message}{distribution_str}"),
+                    code.code().to_string(),
+                ));
             },
             Some(|elt: Option<&T>| elt.is_none()),
             include_missing_sources,

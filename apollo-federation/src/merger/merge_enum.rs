@@ -67,13 +67,13 @@ impl Merger {
             // for this case, it would complicate things and doesn't feel like it would feel very justified. So we merge it as an "output" type, which is the least contraining
             // option. We do raise an hint though so users can notice this.
             let usage = EnumTypeUsage::Unused;
-            self.error_reporter.add_hint(CompositionHint {
-                code: HintCode::UnusedEnumType.code().to_string(),
-                message: format!(
+            self.error_reporter.add_hint(CompositionHint::new(
+                format!(
                     "Enum type \"{}\" is defined but unused. It will be included in the supergraph with all the values appearing in any subgraph (\"as if\" it was only used as an output type).",
                     dest.type_name
                 ),
-            });
+                HintCode::UnusedEnumType.code().to_string(),
+            ));
             usage
         });
 
@@ -429,6 +429,7 @@ pub(crate) mod tests {
             join_directive_identities: Default::default(),
             schema_to_import_to_feature_url: Default::default(),
             latest_federation_version_used: FEDERATION_VERSIONS.latest().version().clone(),
+            field_parent_lookup: std::collections::HashMap::new(),
         })
     }
 

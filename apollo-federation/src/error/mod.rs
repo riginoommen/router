@@ -553,8 +553,6 @@ pub enum SingleFederationError {
     #[error("{message}")]
     OverrideOnInterface { message: String },
     #[error("{message}")]
-    OverrideLabelInvalid { message: String },
-    #[error("{message}")]
     UnsupportedFeature {
         message: String,
         kind: UnsupportedFeatureKind,
@@ -771,7 +769,6 @@ impl SingleFederationError {
                 ErrorCode::OverrideCollisionWithAnotherDirective
             }
             SingleFederationError::OverrideOnInterface { .. } => ErrorCode::OverrideOnInterface,
-            SingleFederationError::OverrideLabelInvalid { .. } => ErrorCode::OverrideLabelInvalid,
             SingleFederationError::UnsupportedFeature { .. } => ErrorCode::UnsupportedFeature,
             SingleFederationError::InvalidFederationSupergraph { .. } => {
                 ErrorCode::InvalidFederationSupergraph
@@ -1155,16 +1152,16 @@ static DEFAULT_METADATA: ErrorCodeMetadata = ErrorCodeMetadata {
 
 struct ErrorCodeCategory<TElement: Clone + Into<String>> {
     // Fn(element: TElement) -> String
-    extract_code: Box<dyn Fn(TElement) -> String + Send + Sync + 'static>,
+    extract_code: Box<dyn 'static + Send + Sync + Fn(TElement) -> String>,
     // Fn(element: TElement) -> String
-    make_doc_description: Box<dyn Fn(TElement) -> String + Send + Sync + 'static>,
+    make_doc_description: Box<dyn 'static + Send + Sync + Fn(TElement) -> String>,
     metadata: ErrorCodeMetadata,
 }
 
 impl<TElement: Clone + Into<String>> ErrorCodeCategory<TElement> {
     fn new(
-        extract_code: Box<dyn Fn(TElement) -> String + Send + Sync + 'static>,
-        make_doc_description: Box<dyn Fn(TElement) -> String + Send + Sync + 'static>,
+        extract_code: Box<dyn 'static + Send + Sync + Fn(TElement) -> String>,
+        make_doc_description: Box<dyn 'static + Send + Sync + Fn(TElement) -> String>,
         metadata: Option<ErrorCodeMetadata>,
     ) -> Self {
         Self {
@@ -1188,7 +1185,7 @@ impl<TElement: Clone + Into<String>> ErrorCodeCategory<TElement> {
 impl ErrorCodeCategory<String> {
     fn new_federation_directive(
         code_suffix: String,
-        make_doc_description: Box<dyn Fn(String) -> String + Send + Sync + 'static>,
+        make_doc_description: Box<dyn 'static + Send + Sync + Fn(String) -> String>,
         metadata: Option<ErrorCodeMetadata>,
     ) -> Self {
         Self::new(
@@ -1831,17 +1828,6 @@ static OVERRIDE_ON_INTERFACE: LazyLock<ErrorCodeDefinition> = LazyLock::new(|| {
     )
 });
 
-static OVERRIDE_LABEL_INVALID: LazyLock<ErrorCodeDefinition> = LazyLock::new(|| {
-    ErrorCodeDefinition::new(
-        "OVERRIDE_LABEL_INVALID".to_owned(),
-        "The @override directive has an invalid label argument.".to_owned(),
-        Some(ErrorCodeMetadata {
-            added_in: "2.7.0",
-            replaces: &[],
-        }),
-    )
-});
-
 static UNSUPPORTED_FEATURE: LazyLock<ErrorCodeDefinition> = LazyLock::new(|| {
     ErrorCodeDefinition::new(
         "UNSUPPORTED_FEATURE".to_owned(),
@@ -2190,7 +2176,6 @@ pub enum ErrorCode {
     OverrideSourceHasOverride,
     OverrideCollisionWithAnotherDirective,
     OverrideOnInterface,
-    OverrideLabelInvalid,
     UnsupportedFeature,
     InvalidFederationSupergraph,
     DownstreamServiceError,
@@ -2305,7 +2290,6 @@ impl ErrorCode {
                 &OVERRIDE_COLLISION_WITH_ANOTHER_DIRECTIVE
             }
             ErrorCode::OverrideOnInterface => &OVERRIDE_ON_INTERFACE,
-            ErrorCode::OverrideLabelInvalid => &OVERRIDE_LABEL_INVALID,
             ErrorCode::UnsupportedFeature => &UNSUPPORTED_FEATURE,
             ErrorCode::InvalidFederationSupergraph => &INVALID_FEDERATION_SUPERGRAPH,
             ErrorCode::DownstreamServiceError => &DOWNSTREAM_SERVICE_ERROR,

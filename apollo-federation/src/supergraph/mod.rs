@@ -17,6 +17,7 @@ use apollo_compiler::collections::IndexSet;
 use apollo_compiler::executable;
 use apollo_compiler::executable::FieldSet;
 use apollo_compiler::name;
+use apollo_compiler::parser::SourceSpan;
 use apollo_compiler::schema::Component;
 use apollo_compiler::schema::ComponentName;
 use apollo_compiler::schema::ComponentOrigin;
@@ -223,6 +224,44 @@ pub struct SupergraphMetadata {
     abstract_types_with_inconsistent_runtime_types: IndexSet<Name>,
 }
 
+/// Enhanced AST node that includes subgraph context for better error reporting
+/// This mirrors TypeScript's SubgraphASTNode functionality for true parity
+#[derive(Debug, Clone)]
+pub struct SubgraphASTNode {
+    /// The original AST node location information
+    pub source_span: SourceSpan,
+    /// The subgraph name where this AST node originated  
+    pub subgraph_name: String,
+    /// Additional context about the AST node type (for tooling integration)
+    pub node_kind: ASTNodeKind,
+}
+
+/// Type of AST node for better tooling integration
+#[derive(Debug, Clone)]
+pub enum ASTNodeKind {
+    Directive,
+    Field,
+    Type,
+    Argument,
+    Other,
+}
+
+impl SubgraphASTNode {
+    /// Create a new SubgraphASTNode with full context
+    pub fn new(source_span: SourceSpan, subgraph_name: String, node_kind: ASTNodeKind) -> Self {
+        Self {
+            source_span,
+            subgraph_name,
+            node_kind,
+        }
+    }
+
+    /// Get a display string for error reporting
+    pub fn display_location(&self) -> String {
+        format!("in subgraph \"{}\"", self.subgraph_name)
+    }
+}
+
 // TODO this should be expanded as needed
 //  @see apollo-federation-types BuildMessage for what is currently used by rover
 #[derive(Clone, Debug)]
@@ -231,9 +270,64 @@ pub struct SupergraphMetadata {
 pub struct CompositionHint {
     pub message: String,
     pub code: String,
+    /// Optional AST nodes for precise error location reporting with subgraph context
+    /// This matches TypeScript's optional nodes approach for true parity
+    pub ast_nodes: Option<Vec<SubgraphASTNode>>,
 }
 
 impl CompositionHint {
+    /// Create a new CompositionHint with message and code (matches TypeScript basic usage)
+    #[allow(unused)]
+    pub(crate) fn new(message: String, code: String) -> Self {
+        Self {
+            message,
+            code,
+            ast_nodes: None,
+        }
+    }
+
+    /// Create a CompositionHint with AST nodes (matches TypeScript enhanced usage)
+    /// This mirrors TypeScript's constructor pattern with optional nodes parameter
+    #[allow(unused)]
+    pub(crate) fn with_ast_nodes(
+        message: String,
+        code: String,
+        ast_nodes: Vec<SubgraphASTNode>,
+    ) -> Self {
+        Self {
+            message,
+            code,
+            //
+            ast_nodes: if ast_nodes.is_empty() {
+                None
+            } else {
+                Some(ast_nodes)
+            },
+        }
+    }
+
+    /// Get formatted error message with subgraph context (matches TypeScript printHint functionality)
+    pub fn formatted_message(&self) -> String {
+        match &self.ast_nodes {
+            Some(nodes) if !nodes.is_empty() => {
+                let subgraph_info = nodes
+                    .iter()
+                    .map(|node| node.display_location())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                if subgraph_info.is_empty() {
+                    self.message.clone()
+                } else {
+                    format!("{} ({})", self.message, subgraph_info)
+                }
+            }
+            _ => self.message.clone(),
+        }
+    }
+
     pub fn code(&self) -> &str {
         &self.code
     }

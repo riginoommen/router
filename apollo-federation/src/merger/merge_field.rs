@@ -21,8 +21,18 @@ impl Merger {
         sources: &Sources<FieldDefinitionPosition>,
         dest: &FieldDefinitionPosition,
     ) -> Result<(), FederationError> {
-        // Validate override directive usage before proceeding with field merging
-        self.validate_override(sources, dest)?;
+        // Convert sources to Node<FieldDefinition> for override validation
+        let dest_field = dest.get(self.merged.schema())?.node.clone();
+        let field_sources = map_sources(sources, |field_pos| {
+            field_pos.as_ref().and_then(|pos| {
+                pos.get(self.merged.schema())
+                    .ok()
+                    .map(|comp| comp.node.clone())
+            })
+        });
+
+        // Validate @override directives
+        let _merge_context = self.validate_override(&field_sources, &dest_field)?;
         let every_source_is_external = sources.iter().all(|(i, source)| {
             let Some(metadata) = self.subgraphs.get(*i).map(|s| s.metadata()) else {
                 // If subgraph not found, consider it not external to fail safely
