@@ -47,8 +47,10 @@ use crate::schema::directive_location::DirectiveLocationExt;
 use crate::schema::position::DirectiveDefinitionPosition;
 use crate::schema::position::DirectiveTargetPosition;
 use crate::schema::position::FieldDefinitionPosition;
+use crate::schema::position::InterfaceFieldDefinitionPosition;
 use crate::schema::position::InterfaceTypeDefinitionPosition;
 use crate::schema::position::ObjectFieldDefinitionPosition;
+use crate::schema::position::ObjectOrInterfaceFieldDefinitionPosition;
 use crate::schema::position::TypeDefinitionPosition;
 use crate::schema::referencer::DirectiveReferencers;
 use crate::schema::type_and_directive_specification::ArgumentMerger;
@@ -141,7 +143,7 @@ enum OverrideHintCode {
 #[derive(Debug)]
 #[allow(dead_code)]
 struct OverrideConflictResult {
-    result: bool,
+    has_incompatible: bool,
     conflicting_directive: Option<String>,
     subgraph: Option<String>,
 }
@@ -925,9 +927,8 @@ impl Merger {
                     pos.insert_directive(dest, (*directive).clone())?;
                 }
             } else if directive_counts.len() == 1 {
-                if let Some((only_application, _)) = directive_counts.iter().next() {
-                    pos.insert_directive(dest, only_application.clone())?;
-                }
+                let only_application = directive_counts.iter().next().unwrap().0.clone();
+                pos.insert_directive(dest, only_application)?;
             } else if let Some(merger) = &directive_in_supergraph.arguments_merger {
                 // When we have multiple unique applications of the directive, and there is a
                 // supplied argument merger, then we merge each of the arguments into a combined
@@ -1625,19 +1626,30 @@ impl Merger {
         // Create new FieldMergeContext from sources (matches TypeScript: const result = new FieldMergeContext(sources))
         let mut merge_context = FieldMergeContext::new();
 
-        // Early return if the field does not have an override directive
-        let pos = ObjectFieldDefinitionPosition {
-            type_name: dest.ty.inner_named_type().clone(),
-            field_name: dest.name.clone(),
-        };
+        let type_name = dest.ty.inner_named_type().clone();
+        let field_name = dest.name.clone();
 
-        if !self
+        let override_fields: HashSet<_> = self
             .fields_with_override
             .object_or_interface_fields()
-            .contains(
-                &crate::schema::position::ObjectOrInterfaceFieldDefinitionPosition::Object(pos),
-            )
-        {
+            .collect();
+
+        let is_object = override_fields.contains(
+            &ObjectOrInterfaceFieldDefinitionPosition::Object(ObjectFieldDefinitionPosition {
+                type_name: type_name.clone(),
+                field_name: field_name.clone(),
+            }),
+        );
+
+        let is_interface =
+            override_fields.contains(&ObjectOrInterfaceFieldDefinitionPosition::Interface(
+                InterfaceFieldDefinitionPosition {
+                    type_name,
+                    field_name,
+                },
+            ));
+
+        if !is_object && !is_interface {
             return Ok(merge_context);
         }
         struct ReduceResult {
@@ -1830,7 +1842,7 @@ impl Merger {
                 source_field,
             );
 
-            if conflict_result.result {
+            if conflict_result.has_incompatible {
                 let conflicting_directive = conflict_result
                     .conflicting_directive
                     .unwrap_or("unknown".to_string());
@@ -1920,7 +1932,15 @@ impl Merger {
                     Some(source_field),
                 );
 
-                if conflict_result.result {
+                // Valid override - process it
+                // Convert field to FieldDefinitionPosition for field usage check
+                let overridden_field_is_referenced = match self.get_field_position(source_field) {
+                    Some(field_pos) => self.is_field_used(from_idx, &field_pos),
+                    None => false, // Conservative fallback when position is unavailable
+                };
+                let override_label = self.get_override_label(override_directive);
+
+                if conflict_result.has_incompatible {
                     let conflicting_directive = conflict_result
                         .conflicting_directive
                         .unwrap_or("unknown".to_string());
@@ -1937,31 +1957,25 @@ impl Merger {
                             conflicting_directive
                         )
                     });
-                    continue;
+                } else {
+                    // Clone the necessary data to avoid borrow conflicts
+                    let override_label_cloned = override_label.map(|s| s.to_string());
+                    let override_directive_cloned = override_directive.clone();
+
+                    self.handle_override_field_validation(
+                        OverrideValidationParams {
+                            from_idx,
+                            source_field,
+                            dest,
+                            subgraph_name,
+                            source_subgraph_name,
+                            overridden_field_is_referenced,
+                            override_label: override_label_cloned.as_deref(),
+                            override_directive: &override_directive_cloned,
+                        },
+                        &mut merge_context,
+                    );
                 }
-
-                // Valid override - process it
-                // Convert field to FieldDefinitionPosition for field usage check
-                let overridden_field_is_referenced = match self.get_field_position(source_field) {
-                    Some(field_pos) => self.is_field_used(from_idx, &field_pos),
-                    None => false, // Conservative fallback when position is unavailable
-                };
-                let override_label = self.get_override_label(override_directive);
-
-                self.handle_override_field_validation(
-                    OverrideValidationParams {
-                        from_idx,
-                        source_field,
-                        dest,
-                        subgraph_name,
-                        source_subgraph_name,
-                        overridden_field_is_referenced,
-                        override_label,
-                        override_directive,
-                    },
-                    &mut merge_context,
-                );
-
                 // Handle override label validation and progressive override
                 if let Some(label) = override_label {
                     if self.is_valid_override_label_complete(label) {
@@ -2032,7 +2046,7 @@ impl Merger {
                 .any(|d| FederationDirective::Requires.matches(&d.name))
             {
                 return OverrideConflictResult {
-                    result: true,
+                    has_incompatible: true,
                     conflicting_directive: Some(
                         FederationDirective::Requires.conflict_name().to_string(),
                     ),
@@ -2051,7 +2065,7 @@ impl Merger {
                 .any(|d| FederationDirective::Provides.matches(&d.name))
             {
                 return OverrideConflictResult {
-                    result: true,
+                    has_incompatible: true,
                     conflicting_directive: Some(
                         FederationDirective::Provides.conflict_name().to_string(),
                     ),
@@ -2068,7 +2082,7 @@ impl Merger {
         if let Some(field) = field {
             if self.is_external(idx, field) {
                 return OverrideConflictResult {
-                    result: true,
+                    has_incompatible: true,
                     conflicting_directive: Some(
                         FederationDirective::External.conflict_name().to_string(),
                     ),
@@ -2078,7 +2092,7 @@ impl Merger {
         }
 
         OverrideConflictResult {
-            result: false,
+            has_incompatible: false,
             conflicting_directive: None,
             subgraph: None,
         }
@@ -2460,82 +2474,57 @@ impl Merger {
         params: OverrideValidationParams<'_>,
         merge_context: &mut FieldMergeContext,
     ) {
+        let coordinate = params.dest.coordinate();
+        let directive_ast_nodes = self.extract_ast_nodes_with_subgraph(
+            params.override_directive,
+            params.subgraph_name,
+            ASTNodeKind::Directive,
+        );
+
         if self.is_external(params.from_idx, params.source_field) {
-            // Field is explicitly marked external
-            let ast_nodes = self.extract_ast_nodes_with_subgraph(
-                params.override_directive,
-                params.subgraph_name,
-                ASTNodeKind::Directive,
-            );
-            let hint = CompositionHint::with_ast_nodes(
+            // @external field: suggest removing @override
+            self.error_reporter.add_hint(CompositionHint::with_ast_nodes(
                 format!(
                     "Field \"{}\" on subgraph \"{}\" is not resolved anymore by the from subgraph (it is marked \"@external\" in \"{}\"). The @override directive can be removed.",
-                    params.dest.coordinate(),
+                    coordinate,
                     params.subgraph_name,
                     params.source_subgraph_name
                 ),
-                OverrideHintCode::OverrideDirectiveCanBeRemoved
-                    .as_str()
-                    .to_string(),
-                ast_nodes,
-            );
-            self.error_reporter.add_hint(hint);
-        } else {
-            // Handle field usage and provide appropriate hints
-            self.handle_overridden_field_hints(params, merge_context);
+                OverrideHintCode::OverrideDirectiveCanBeRemoved.as_str().to_string(),
+                directive_ast_nodes,
+            ));
+            return;
         }
-    }
 
-    /// Handle hints for overridden fields based on usage
-    fn handle_overridden_field_hints(
-        &mut self,
-        params: OverrideValidationParams<'_>,
-        merge_context: &mut FieldMergeContext,
-    ) {
-        match params.overridden_field_is_referenced {
-            true => {
-                merge_context.set_used_overridden(params.from_idx);
-                if params.override_label.is_none() {
-                    let ast_nodes = self.extract_ast_nodes_with_subgraph(
-                        params.override_directive,
-                        params.source_subgraph_name,
-                        ASTNodeKind::Directive,
-                    );
-                    let hint = CompositionHint::with_ast_nodes(
-                        format!(
-                            "Field \"{}\" on subgraph \"{}\" is overridden. It is still used in some federation directive(s) (@key, @requires, and/or @provides) and/or to satisfy interface constraint(s), but consider marking it @external explicitly or removing it along with its references.",
-                            params.dest.coordinate(),
-                            params.source_subgraph_name
-                        ),
-                        OverrideHintCode::OverriddenFieldCanBeRemoved
-                            .as_str()
-                            .to_string(),
-                        ast_nodes,
-                    );
-                    self.error_reporter.add_hint(hint);
-                }
+        if params.overridden_field_is_referenced {
+            merge_context.set_used_overridden(params.from_idx);
+
+            if params.override_label.is_none() {
+                self.error_reporter.add_hint(CompositionHint::with_ast_nodes(
+                    format!(
+                        "Field \"{}\" on subgraph \"{}\" is overridden. It is still used in some federation directive(s) (@key, @requires, and/or @provides) and/or to satisfy interface constraint(s), but consider marking it @external explicitly or removing it along with its references.",
+                        coordinate,
+                        params.source_subgraph_name
+                    ),
+                    OverrideHintCode::OverriddenFieldCanBeRemoved.as_str().to_string(),
+                    directive_ast_nodes,
+                ));
             }
-            false => {
-                merge_context.set_unused_overridden(params.from_idx);
-                if params.override_label.is_none() {
-                    let ast_nodes = self.extract_ast_nodes_with_subgraph(
-                        params.override_directive,
-                        params.source_subgraph_name,
-                        ASTNodeKind::Directive,
-                    );
-                    let hint = CompositionHint::with_ast_nodes(
+        } else {
+            merge_context.set_unused_overridden(params.from_idx);
+
+            if params.override_label.is_none() {
+                self.error_reporter
+                    .add_hint(CompositionHint::with_ast_nodes(
                         format!(
                             "Field \"{}\" on subgraph \"{}\" is overridden. Consider removing it.",
-                            params.dest.coordinate(),
-                            params.source_subgraph_name
+                            coordinate, params.source_subgraph_name
                         ),
                         OverrideHintCode::OverriddenFieldCanBeRemoved
                             .as_str()
                             .to_string(),
-                        ast_nodes,
-                    );
-                    self.error_reporter.add_hint(hint);
-                }
+                        directive_ast_nodes,
+                    ));
             }
         }
     }
@@ -2868,7 +2857,7 @@ mod override_tests {
             merger.override_conflicts_with_other_directive(0, None, "test_subgraph", 1, None);
 
         // Should return no conflict for None fields
-        assert!(!result.result);
+        assert!(!result.has_incompatible);
         assert!(result.conflicting_directive.is_none());
         assert!(result.subgraph.is_none());
     }
@@ -2910,7 +2899,7 @@ mod override_tests {
         );
 
         // Should detect conflict with @requires
-        assert!(result.result);
+        assert!(result.has_incompatible);
         assert_eq!(
             result.conflicting_directive,
             Some(FederationDirective::Requires.conflict_name().to_string())
@@ -2955,7 +2944,7 @@ mod override_tests {
         );
 
         // Should detect conflict with @provides
-        assert!(result.result);
+        assert!(result.has_incompatible);
         assert_eq!(
             result.conflicting_directive,
             Some(FederationDirective::Provides.conflict_name().to_string())
@@ -3000,7 +2989,7 @@ mod override_tests {
         );
 
         // Should detect conflict with @federation__requires
-        assert!(result.result);
+        assert!(result.has_incompatible);
         assert_eq!(
             result.conflicting_directive,
             Some(FederationDirective::Requires.conflict_name().to_string())
@@ -3032,7 +3021,7 @@ mod override_tests {
         );
 
         // Should not detect any conflicts
-        assert!(!result.result);
+        assert!(!result.has_incompatible);
         assert!(result.conflicting_directive.is_none());
         assert!(result.subgraph.is_none());
     }
