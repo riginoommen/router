@@ -1819,48 +1819,6 @@ impl Merger {
                 continue;
             }
 
-            // Check for conflicting directives (@requires, @provides, @external)
-            let Some(source_subgraph_idx) = self
-                .subgraphs
-                .iter()
-                .position(|s| s.name.as_str() == source_subgraph_name)
-            else {
-                // This should not happen as we validated the subgraph exists above
-                continue;
-            };
-            let source_field = reduce_result
-                .subgraph_map
-                .get(source_subgraph_name)
-                .and_then(|info| info.field.as_ref());
-            let current_field = subgraph_info.field.as_ref();
-
-            let conflict_result = self.override_conflicts_with_other_directive(
-                subgraph_info.idx,
-                current_field,
-                subgraph_name,
-                source_subgraph_idx,
-                source_field,
-            );
-
-            if conflict_result.has_incompatible {
-                let conflicting_directive = conflict_result
-                    .conflicting_directive
-                    .unwrap_or("unknown".to_string());
-                let conflict_subgraph = conflict_result.subgraph.unwrap_or("unknown".to_string());
-
-                self.error_reporter.add_error(CompositionError::DirectiveDefinitionInvalid {
-                    message: format!(
-                        "@override cannot be used on field \"{}\" on subgraph \"{}\" since \"{}\" on \"{}\" is marked with directive \"@{}\"",
-                        dest.coordinate(),
-                        subgraph_name,
-                        dest.coordinate(),
-                        conflict_subgraph,
-                        conflicting_directive
-                    )
-                });
-                continue;
-            }
-
             // Check if source subgraph has the field
             let source_info = match reduce_result.subgraph_map.get(source_subgraph_name) {
                 Some(info) => info,
@@ -1905,6 +1863,7 @@ impl Merger {
                         })
                     })
                     .collect();
+
                 let abstracting_types_str_refs: Vec<&str> =
                     abstracting_types.iter().map(|s| s.as_str()).collect();
                 let abstracting_types_str = self.print_types(&abstracting_types_str_refs);
@@ -1921,94 +1880,84 @@ impl Merger {
                 continue;
             }
 
-            // Check for directive conflicts
-            if let Some(source_field) = &source_info.field {
-                let from_idx = source_info.idx;
-                let conflict_result = self.override_conflicts_with_other_directive(
-                    subgraph_info.idx,
-                    subgraph_info.field.as_ref(),
-                    subgraph_name,
-                    from_idx,
-                    Some(source_field),
-                );
+            // Check for conflicting directives (@requires, @provides, @external)
+            let Some(source_subgraph_idx) = self
+                .subgraphs
+                .iter()
+                .position(|s| s.name.as_str() == source_subgraph_name)
+            else {
+                // This should not happen as we validated the subgraph exists above
+                continue;
+            };
+            let source_field = reduce_result
+                .subgraph_map
+                .get(source_subgraph_name)
+                .and_then(|info| info.field.as_ref());
 
+            let current_field = subgraph_info.field.as_ref();
+
+            let conflict_result = self.override_conflicts_with_other_directive(
+                subgraph_info.idx,
+                current_field,
+                subgraph_name,
+                source_subgraph_idx,
+                source_field,
+            );
+
+            if conflict_result.has_incompatible {
+                let conflicting_directive = conflict_result
+                    .conflicting_directive
+                    .unwrap_or("unknown".to_string());
+
+                let conflict_subgraph = conflict_result.subgraph.unwrap_or("unknown".to_string());
+
+                let from_field_coord = source_field
+                    .map(|f| f.coordinate().to_string())
+                    .unwrap_or_else(|| dest.coordinate().to_string());
+
+                self.error_reporter.add_error(CompositionError::DirectiveDefinitionInvalid {
+                    message: format!(
+                        "@override cannot be used on field \"{}\" on subgraph \"{}\" since \"{}\" on \"{}\" is marked with directive \"@{}\"",
+                        from_field_coord,
+                        subgraph_name,
+                        dest.coordinate(),
+                        conflict_subgraph,
+                        conflicting_directive
+                    )
+                });
+                continue;
+            }
+
+            if let Some(source_field) = &source_info.field {
                 // Valid override - process it
                 // Convert field to FieldDefinitionPosition for field usage check
+                let from_idx = source_info.idx;
+
                 let overridden_field_is_referenced = match self.get_field_position(source_field) {
                     Some(field_pos) => self.is_field_used(from_idx, &field_pos),
                     None => false, // Conservative fallback when position is unavailable
                 };
                 let override_label = self.get_override_label(override_directive);
 
-                if conflict_result.has_incompatible {
-                    let conflicting_directive = conflict_result
-                        .conflicting_directive
-                        .unwrap_or("unknown".to_string());
-                    let conflict_subgraph =
-                        conflict_result.subgraph.unwrap_or("unknown".to_string());
+                self.handle_override_field_validation(
+                    OverrideValidationParams {
+                        from_idx,
+                        source_field,
+                        dest,
+                        subgraph_name,
+                        source_subgraph_name,
+                        overridden_field_is_referenced,
+                        override_label: override_label.as_deref(),
+                        override_directive: &override_directive,
+                    },
+                    &mut merge_context,
+                );
 
-                    self.error_reporter.add_error(CompositionError::DirectiveDefinitionInvalid {
-                        message: format!(
-                            "@override cannot be used on field \"{}\" on subgraph \"{}\" since \"{}\" on \"{}\" is marked with directive \"@{}\"",
-                            dest.coordinate(),
-                            subgraph_name,
-                            dest.coordinate(),
-                            conflict_subgraph,
-                            conflicting_directive
-                        )
-                    });
-                } else {
-                    // Clone the necessary data to avoid borrow conflicts
-                    let override_label_cloned = override_label.map(|s| s.to_string());
-                    let override_directive_cloned = override_directive.clone();
-
-                    self.handle_override_field_validation(
-                        OverrideValidationParams {
-                            from_idx,
-                            source_field,
-                            dest,
-                            subgraph_name,
-                            source_subgraph_name,
-                            overridden_field_is_referenced,
-                            override_label: override_label_cloned.as_deref(),
-                            override_directive: &override_directive_cloned,
-                        },
-                        &mut merge_context,
-                    );
-                }
-                // Handle override label validation and progressive override
                 if let Some(label) = override_label {
                     if self.is_valid_override_label_complete(label) {
                         let label_string = label.to_string();
                         merge_context.set_override_label(subgraph_info.idx, label_string.clone());
                         merge_context.set_override_label(from_idx, label_string);
-
-                        // Add progressive override hint
-                        let message = match overridden_field_is_referenced {
-                            true => format!(
-                                "Field \"{}\" on subgraph \"{}\" is currently being migrated via progressive @override. It is still used in some federation directive(s) (@key, @requires, and/or @provides) and/or to satisfy interface constraint(s). Once the migration is complete, consider marking it @external explicitly or removing it along with its references.",
-                                dest.coordinate(),
-                                source_subgraph_name
-                            ),
-                            false => format!(
-                                "Field \"{}\" is currently being migrated with progressive @override. Once the migration is complete, remove the field from subgraph \"{}\".",
-                                dest.coordinate(),
-                                source_subgraph_name
-                            ),
-                        };
-
-                        // Extract AST nodes from override directive for precise error location with subgraph context
-                        let ast_nodes = self.extract_ast_nodes_with_subgraph(
-                            override_directive,
-                            subgraph_name,
-                            ASTNodeKind::Directive,
-                        );
-                        let hint = CompositionHint::with_ast_nodes(
-                            message,
-                            "OVERRIDE_MIGRATION_IN_PROGRESS".to_string(),
-                            ast_nodes,
-                        );
-                        self.error_reporter.add_hint(hint);
                     } else {
                         self.error_reporter.add_error(CompositionError::DirectiveDefinitionInvalid {
                             message: format!(
@@ -2019,6 +1968,32 @@ impl Merger {
                             )
                         });
                     }
+                    let message = match overridden_field_is_referenced {
+                        true => format!(
+                            "Field \"{}\" on subgraph \"{}\" is currently being migrated via progressive @override. It is still used in some federation directive(s) (@key, @requires, and/or @provides) and/or to satisfy interface constraint(s). Once the migration is complete, consider marking it @external explicitly or removing it along with its references.",
+                            dest.coordinate(),
+                            source_subgraph_name
+                        ),
+                        false => format!(
+                            "Field \"{}\" is currently being migrated with progressive @override. Once the migration is complete, remove the field from subgraph \"{}\".",
+                            dest.coordinate(),
+                            source_subgraph_name
+                        ),
+                    };
+
+                    // Extract AST nodes from override directive for precise error location with subgraph context
+                    let ast_nodes = self.extract_ast_nodes_with_subgraph(
+                        override_directive,
+                        subgraph_name,
+                        ASTNodeKind::Directive,
+                    );
+                    let hint = CompositionHint::with_ast_nodes(
+                        message,
+                        "OVERRIDE_MIGRATION_IN_PROGRESS".to_string(),
+                        ast_nodes,
+                    );
+
+                    self.error_reporter.add_hint(hint);
                 }
             }
         }
@@ -2187,8 +2162,15 @@ impl Merger {
             return true;
         }
 
-        // Check percent format - regex already validates range and format
-        PERCENT_REGEX.is_match(label)
+        if let Some(caps) = PERCENT_REGEX.captures(label) {
+            if let Some(number_str) = caps.get(1) {
+                if let Ok(percent) = number_str.as_str().parse::<f64>() {
+                    return (0.0..=100.0).contains(&percent);
+                }
+            }
+        }
+
+        false
     }
 
     /// Convert Node<FieldDefinition> to FieldDefinitionPosition using O(1) lookup
