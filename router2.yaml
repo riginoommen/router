@@ -1,0 +1,15 @@
+experimental_chaos:
+  force_schema_reload: 5s
+
+telemetry:
+  apollo:
+    field_level_instrumentation_sampler: always_off
+  exporters:
+    metrics:
+      otlp:
+        enabled: true
+    tracing:
+      common:
+        sampler: 0.0001
+      otlp:
+        enabled: true
