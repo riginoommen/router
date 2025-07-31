@@ -1,0 +1,128 @@
+---
+base: 'http://localhost:4000'
+concurrency: 12
+iterations: 60000
+ramp_up: 30s
+duration: 6000s
+
+plan:
+  # Basic introspection - should always work
+  - name: "schema introspection"
+    weight: 30
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query IntrospectionQuery { __schema { queryType { name } mutationType { name } } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Simple type introspection
+  - name: "type introspection"
+    weight: 20
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query TypeIntrospection { __type(name: \"Query\") { name fields { name type { name } } } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Simple query for top products - basic federation test
+  - name: "top products basic"
+    weight: 25
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query TopProducts { topProducts { upc name } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Top products with variables
+  - name: "top products with limit"
+    weight: 15
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query TopProductsWithLimit($first: Int) { topProducts(first: $first) { upc name } }", "variables": {"first": 3}}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Simple me query - basic federation test
+  - name: "me query basic"
+    weight: 20
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query GetMe { me { id } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Test recommended products
+  - name: "recommended products basic"
+    weight: 15
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query RecommendedProducts { recommendedProducts { upc name } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Simple mutation test
+  - name: "create product mutation"
+    weight: 8
+    request:
+      url: /
+      method: POST
+      body: '{"query": "mutation CreateProduct($upc: ID!, $name: String) { createProduct(upc: $upc, name: $name) { upc name } }", "variables": {"upc": "test-123", "name": "Test Product"}}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Simple create review mutation
+  - name: "create review mutation"
+    weight: 7
+    request:
+      url: /
+      method: POST
+      body: '{"query": "mutation CreateReview($upc: ID!, $id: ID!, $body: String) { createReview(upc: $upc, id: $id, body: $body) { id body } }", "variables": {"upc": "test-123", "id": "review-456", "body": "Great product!"}}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Health check query - should always work
+  - name: "typename query"
+    weight: 10
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query TypeName { __typename }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Complex field introspection
+  - name: "product type introspection"
+    weight: 5
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query ProductTypeIntrospection { __type(name: \"Product\") { name fields { name type { name kind } } } }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
+
+  # Test error handling with invalid query
+  - name: "invalid query test"
+    weight: 3
+    request:
+      url: /
+      method: POST
+      body: '{"query": "query InvalidQuery { nonExistentField }"}'
+      headers:
+        Content-Type: 'application/json'
+        Accept: 'application/json'
